@@ -2,10 +2,17 @@
 name: address-database
 description: >-
   Design for the per-game-version address and offset database: patterns as the source of truth, resolved addresses cached per executable hash, the loader resolving symbols by name so a game update touches the loader's data and not every plugin.
-status: proposal
+status: implemented
 created: 2026-10-03T07:00+0200
-last_edited: 2026-10-03T07:00+0200
+last_edited: 2026-10-03T07:30+0200
 ---
+
+> [!NOTE]
+> Implemented on 2026-10-03 as [dayz-data](https://github.com/dayz-plugins/dayz-data) (the
+> data) plus `crates/dayz-data` and `tools/dayz-data-tool` in the loader (the code). The name
+> is `dayz-data` rather than `dayz-offsets`, and the game directory holds it at
+> `dayz-plugins/data/`. Everything below describes what was built, except where an open
+> question says otherwise.
 
 # Address and offset database
 
@@ -37,7 +44,7 @@ costs a few milliseconds of startup and removes most of that work.
 
 ## Where it lives
 
-A separate data repository, `dayz-offsets`, holding JSON only and no code.
+A separate data repository, `dayz-data`, holding JSON only and no code.
 
 Reasons for the split: data can be corrected without releasing the loader, a contributor can
 open a pull request against it without a Rust toolchain, and its validation is a schema check
@@ -46,19 +53,22 @@ also reads a user-side directory that wins over the bundle, so a user can drop i
 brand-new build the day it ships.
 
 ```
-dayz-offsets/
+dayz-data/
 ├── patterns.json              version independent signatures, the source of truth
 ├── builds/
-│   ├── 1.29.163709.json       resolved cache for one executable hash
-│   └── 1.30.xxxxxx.json
+│   └── 1.29.163709.json       resolved cache for one executable hash
+├── seeds/
+│   └── 1.29.163709.json       the addresses a person established, input to the generator
 ├── schema/
 │   ├── patterns.schema.json
 │   └── build.schema.json
-└── README.md
+├── README.md
+└── AGENTS.md
 ```
 
-In the game directory the loader looks in `dayz-plugins/offsets/`, falling back to its
-bundled copy. A cache entry it generated itself is written there, never into the bundle.
+In the game directory the loader looks in `dayz-plugins/data/`, which `build.sh --deploy`
+fills from a checkout of the data repository. A cache entry the loader generated itself is
+written there, never back into the repository.
 
 ## Keying
 
@@ -160,11 +170,25 @@ This is also where the version-independence claim gets its teeth: a plugin that 
 names symbols has no build-specific code in it at all, so it keeps working across game
 updates without being touched.
 
+## What was built, measured
+
+Against the real 1.29.163709 executable, all 21 seeded symbols and 11 offsets resolve from
+the cache with zero issues, and all 17 code symbols also resolve by pattern scanning alone,
+at the same addresses, with the cache removed. That second result is the one that matters: it
+is the mechanism a game update depends on, exercised rather than assumed.
+
+Two things turned out differently from the sketch above. A global gets no byte check and no
+pattern, because its bytes in the file are initialisation data rather than what memory holds
+at runtime, so a check over one would fail on every launch. And generated patterns are
+literal byte runs, since deriving wildcards needs a length-disassembler the tool does not
+have; they are correct for the build they came from and need operand bytes wildcarded by hand
+to survive an update.
+
 ## Open questions
 
-- **Scan cost.** A pattern scan over a 70 MB image is a few milliseconds per pattern with a
-  decent search, but a hundred patterns at startup is worth measuring before committing to
-  scan-always. Mitigation if it bites: scan lazily on first lookup of an unresolved symbol.
+- **Scan cost.** Not yet measured in the game. The image is 68 MB mapped and scanning only
+  covers symbols the cache does not, so a known build scans nothing; the cost only appears
+  after an update. Mitigation if it bites: scan lazily on first lookup.
 - **Who owns a symbol's name?** A plugin that needs something the database does not have
   should be able to carry its own pattern file rather than wait for an upstream entry. This
   argues for a per-plugin `offsets/<plugin>.json` merged into the same table under a
