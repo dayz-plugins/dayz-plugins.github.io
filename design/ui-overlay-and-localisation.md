@@ -2,10 +2,18 @@
 name: ui-overlay-and-localisation
 description: >-
   Design for plugin-drawn UI and HUD overlays, a loader-owned translation catalog, and key hints that follow the input device in use. One pipeline: the loader owns egui, plugins talk to it through an immediate-mode C ABI, text comes from catalogs by key, and a hint is an action resolved to a binding, a device and a glyph.
-status: proposal
+status: partially-implemented
 created: 2026-10-03T08:15+0200
-last_edited: 2026-10-03T08:15+0200
+last_edited: 2026-10-03T08:40+0200
 ---
+
+> [!NOTE]
+> Part 1 shipped on 2026-10-03 in the loader as `crates/dayz-plugin-loader/src/win/ui/`, with
+> ABI version 4: `egui` 0.35 behind `egui-directx11`, the window subclass, panels a plugin
+> registers, the `ui_widget` entry point, and the loader's own console drawn in the game.
+> Parts 2 and 3 — the localisation catalogs and the device-aware key hints — are still
+> proposals. What shipped differs from the sketch below in one place, noted in **The
+> plugin-facing ABI**: there is no `ui_window_begin`/`ui_window_end` pair.
 
 # UI overlays, localisation and input-aware key hints
 
@@ -99,7 +107,20 @@ whenever the loader bumps egui. That is strictly worse than the existing `API_VE
 which only forces a rebuild when the ABI itself changes.
 
 Instead, an immediate-mode facade. The loader calls the plugin once per frame with an opaque
-frame token; the plugin calls back through host functions that take it:
+frame token; the plugin calls back through host functions that take it.
+
+**What was built, and why it is not what the C sketch below says.** egui's containers are
+closure-based: `Window::show(ctx, |ui| ...)` owns its body, and `Area::begin` is private, so a
+`ui_window_begin` / `ui_window_end` pair across the ABI cannot be implemented without
+rebuilding window chrome by hand. The loader therefore owns the window — a plugin registers a
+panel up front and the loader calls `on_ui` *inside* the closure — and the plugin's body is a
+flat sequence of widgets. That is closer to the "declared elements" tier than the sketch was,
+and it costs nested layout (`horizontal`, `group`, `collapsing`), which is an open question
+below. All widgets go through one `ui_widget` entry point taking a `UiWidget` kind rather than
+one table entry per widget, so a new widget is a new enum variant rather than a new ABI
+version.
+
+The sketch as originally written:
 
 ```rust
 // What a plugin writes, through the SDK wrapper.
@@ -133,7 +154,8 @@ Properties worth stating, because they are the point:
   plugin that faults in `on_ui` is disabled like any other.
 - **Widgets bind to settings by name** (`ui_slider_setting`), so a settings panel needs no
   state in the plugin and validation stays in one place.
-- **Text is a key, not a sentence.** See part 2. A plugin that passes a literal string still
+- **Text is a key, not a sentence** — once part 2 exists. Until then a string is drawn as it
+  is, which is also the fallback for a key no catalog knows. See part 2. A plugin that passes a literal string still
   works — a key that is not in any catalog renders as itself — which keeps the quick case
   quick and the correct case barely longer.
 
@@ -286,6 +308,10 @@ changing meaning:
 
 ## Open questions
 
+- **Nested layout.** The shipped body is a flat widget list. Horizontal rows, groups and
+  collapsing sections are all closure-shaped in egui, so they need either a begin/end protocol
+  with the loader keeping an explicit `Ui` stack, or a declarative row builder. Nothing should
+  be designed here until a plugin actually needs it.
 - **Per-eye UI placement in VR.** A quad layer is right for panels; a HUD element may want to
   be head-locked, world-locked or weapon-locked. Does the anchor vocabulary need a third axis
   for that, or does the VR plugin own the transform and the UI plugin stay flat?
