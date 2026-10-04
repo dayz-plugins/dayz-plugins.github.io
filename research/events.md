@@ -249,17 +249,23 @@ four values before the event exists.
 three writes agree:
 
 ```c
-puVar4 = FUN_14033a260(len + 0x18);      // allocate header + characters
+iVar2 = end - src;                        // strlen + 1, `end` is past the terminator
+uVar5 = iVar2 - 1;                        // strlen
+puVar4 = FUN_14033a260(uVar5 + 0x18);     // allocate header + characters
 *puVar4 = 0;                              // +0x00  u32 refcount
-*(ulonglong *)(puVar4 + 2) = len;         // +0x08  u64 length, excluding the terminator
-memmove(puVar4 + 4, src, len + 1);        // +0x10  the characters, NUL terminated
+*(ulonglong *)(puVar4 + 2) = uVar5 + 1;   // +0x08  u64 length — strlen + 1
+memmove(puVar4 + 4, src, iVar2);          // +0x10  the characters and the terminator
 ```
 
 | Offset | Field |
 | --- | --- |
 | `+0x00` | `u32` refcount — the engine touches it with `LOCK INC` / `LOCK DEC` and frees at one |
-| `+0x08` | `u64` length |
+| `+0x08` | `u64` length, **including the terminator**: `strlen + 1` |
 | `+0x10` | the characters, NUL terminated |
+
+The length counting the terminator is easy to get wrong and was: the first chat line through
+the loader's hook came out as `Survivor\0`, because the field was read as a character count.
+Take `length - 1` characters, or stop at the first NUL.
 
 An **empty string is a null holder**, not a holder of length zero: `0x5DC10` returns null for
 `""`. So a null holder has to read as `""`, and code that treats null as absent will lose
@@ -272,6 +278,10 @@ a swallowed line leaks its own text, about `0x18` bytes plus its length. The loa
 that and says so. Releasing them from a hook would mean reimplementing the engine's reference
 counting against a pointer whose other owners are unknown, and getting that wrong is a double
 free in the middle of a frame.
+
+**Verified**: hooked in a live session, a line typed into the game's own chat box arrived as
+channel `0`, from `Survivor`, text `loader chat hook test` — and the `ChatMessageEvent` it
+builds came through `0x1D6260` in the same millisecond, which confirms the chain above.
 
 A hook here sees every message from every source — other players, the server, admin messages,
 BattlEye, and the client's own `Chat`/`ChatPlayer` calls — and **returning without calling the
