@@ -4,7 +4,7 @@ description: >-
   DayZ 1.29.163709 event system: EventType is a C++ RTTI pointer, how events are raised and dispatched into script, the full event table with payloads, how chat messages arrive and are sent, how mod RPCs travel, and the session natives for connect, disconnect and exit.
 game_build: DayZ 1.29.163709 (DayZ_x64.exe, PE timestamp 0x6A72FC58)
 created: 2026-10-04T20:05+0200
-last_edited: 2026-10-04T20:05+0200
+last_edited: 2026-10-04T20:15+0200
 ---
 
 # Events, chat and RPC (DayZ 1.29.163709)
@@ -52,10 +52,39 @@ Every event class has the same six-slot vtable (`game::ChatMessageEvent::vftable
 
 Slot 1 and slot 2 are each 14 bytes and do nothing but write a constant into the out-parameter
 (`0x71B4D0` and `0x71B5A0` for `ChatMessageEvent`). **Slot 2 is the useful one for a plugin**:
-calling it on any event object yields the event's name as text, with no address table and no
-RTTI parsing, which means a hook can name events it has never heard of — including the ones
-script cannot see at all (`ReloadShadersEvent`, `SetPausedEvent`, `CrashLogEvent` and the rest
-of the list the shipped scripts enumerate in a comment but do not declare).
+it yields the event's name as text, with no address table and no RTTI parsing, which means a
+hook can name events it has never heard of — including the ones script cannot see at all
+(`ReloadShadersEvent`, `SetPausedEvent`, `CrashLogEvent` and the rest of the list the shipped
+scripts enumerate in a comment but do not declare).
+
+#### Better: read the name, do not call for it
+
+Every one of these getters compiles to the same fourteen bytes, because every one of them is
+the same one-line function:
+
+```asm
+48 8D 05 <rel32>   lea rax, [rip+disp]   ; the string literal
+48 89 02           mov [rdx], rax
+48 8B C2           mov rax, rdx
+C3                 ret
+```
+
+So a hook does not have to **call** an unknown function pointer out of a vtable in the
+middle of a frame. It can read those fourteen bytes, check they are that exact shape, decode
+the `rel32`, and read the literal — all plain memory reads, nothing in the game executed.
+
+The shape check is also the validation, which is the point. Of the **168** classes in this
+build whose name contains "Event", **106** have the shape at slot 2. The 62 that do not are
+not broadcaster events at all: handlers, functors, weak-pointer trackers, `AISlotEvent*`,
+`NetworkMessageShotEvent`, the `Statistics::StatEvent*` hierarchy. Restricting to the real
+`game::*Event` and `enf::*Event` classes, **76 of 77 match**, and the one that does not —
+`enf::AISlotEvent`, whose slot 2 is `mov al, 1; ret` — is a predicate on a class that is not
+raised through the event manager. An object that is not an event is therefore *rejected*
+rather than misread, and the loader reports it by vtable address instead.
+
+Verified at runtime: the loader's `game_events` module does exactly this, and a session that
+raised `StartedEvent`, `StartupEvent`, `ScriptLogEvent` and `WorldCleaupEvent` named **5 of 5
+classes with 0 rejected**.
 
 ### Raising and dispatching
 
@@ -74,7 +103,8 @@ of the list the shipped scripts enumerate in a comment but do not declare).
 | What | RVA | Evidence |
 | --- | --- | --- |
 | Event manager getter | `0x1D2BD0` | decompiled, called by both raisers inspected |
-| Raise an event | `0x1D6260` | decompiled, `(manager, &event)` |
+| **The event manager itself** | `0xFEBBE0` | decompiled; the global the getter returns |
+| Raise an event | `0x1D6260` | **verified** — hooked, `(manager, &event)` |
 | Dispatch into script `OnEvent` | `0x5CACD0` | decompiled |
 | The engine's handling when script did not take it | `0x5CACB0` | decompiled |
 | `EventType` registration (all ids) | `0x5B77C0` | decompiled |
@@ -100,10 +130,38 @@ string is a 4936-byte function at `0x5B8560` that has not been read yet and is t
 place for a per-event-class marshaller. Until that is traced, **a plugin hooking `0x5CACD0`
 can name an event reliably and read its payload only speculatively.**
 
-Two hook points follow, with different reach:
+#### `0x1D6260` is a plain broadcaster
+
+Decompiled, it is a dozen lines: two listener arrays on the manager, walked in order.
+
+```c
+for (i = 0; i < *(int *)(manager + 0x214); i++) {              // first array
+    listener = *(longlong **)(*(longlong *)(manager + 0x208) + i * 8);
+    (**(code **)(*listener + 8))(listener, event);              // vtable slot 1
+}
+for (i = 0; i < *(int *)(manager + 0x1F4); i++) {              // second array
+    listener = *(longlong **)(*(longlong *)(manager + 0x1E8) + i * 8);
+    (**(code **)(*listener + 0x78))(listener, event);           // vtable slot 15
+}
+```
+
+| Offset on the manager | What |
+| --- | --- |
+| `+0x208` / `+0x214` | Listener array and count, dispatched on vtable slot 1 |
+| `+0x1E8` / `+0x1F4` | Listener array and count, dispatched on vtable slot 15 |
+
+Two consequences. A plugin could in principle **register itself as a listener** by appending
+to one of those arrays, which needs no code patching at all — but it also needs a fabricated
+C++ object with a sixteen-slot vtable and a grown engine array, so the loader detours the
+function instead. And a detour here is the one place a five-byte patch is genuinely risky,
+because the engine calls it constantly: the loader therefore installs during its own
+initialisation, on the game's first DXGI call, while the renderer is still being built.
+
+#### Which hook point to use
 
 - **`0x1D6260`** sees *every* event the engine raises, including those that never reach
-  script. Best for a listener.
+  script, and its `this` is the global at `0xFEBBE0`. Best for a listener, and what the
+  loader uses.
 - **`0x5CACD0`** sees only events on their way to script, and **its return value decides
   whether the engine still handles the event**. Returning 1 without calling the original is
   how a plugin swallows one.
@@ -177,11 +235,43 @@ Every chat line the client displays is raised by **`0x719B90`** (decompiled), wh
 FUN_140719b90(game, int channel, RefString *from, RefString *text, RefString *colourClass)
 ```
 
-The three string arguments are Enfusion refcounted blocks — a pointer whose first `int` is the
-refcount, which the function increments into the event and decrements on the way out. The
-event it builds holds its vtable, those three pointers and the channel; the exact offsets are
-not given here, because the decompiler's stack-local names are not field offsets and reading
-them as such is how the first draft of this file got them wrong.
+The three string arguments are `RefString **` — pointers to Enfusion refcounted string
+holders, which the function **moves out of**: it takes each holder, nulls the caller's
+pointer, and owns the reference from then on. The event it builds holds its vtable, those
+three pointers and the channel; the exact field offsets are not given here, because the
+decompiler's stack-local names are not field offsets and reading them as such is how the first
+draft of this file got them wrong. They are also not needed — the arguments carry the same
+four values before the event exists.
+
+#### The string holder layout
+
+`0x5DC10` builds a holder from a C string and settles it, because the allocation size and the
+three writes agree:
+
+```c
+puVar4 = FUN_14033a260(len + 0x18);      // allocate header + characters
+*puVar4 = 0;                              // +0x00  u32 refcount
+*(ulonglong *)(puVar4 + 2) = len;         // +0x08  u64 length, excluding the terminator
+memmove(puVar4 + 4, src, len + 1);        // +0x10  the characters, NUL terminated
+```
+
+| Offset | Field |
+| --- | --- |
+| `+0x00` | `u32` refcount — the engine touches it with `LOCK INC` / `LOCK DEC` and frees at one |
+| `+0x08` | `u64` length |
+| `+0x10` | the characters, NUL terminated |
+
+An **empty string is a null holder**, not a holder of length zero: `0x5DC10` returns null for
+`""`. So a null holder has to read as `""`, and code that treats null as absent will lose
+every empty field.
+
+#### What swallowing costs
+
+Because `0x719B90` takes ownership of the three holders, not calling it leaves them unreleased:
+a swallowed line leaks its own text, about `0x18` bytes plus its length. The loader accepts
+that and says so. Releasing them from a hook would mean reimplementing the engine's reference
+counting against a pointer whose other owners are unknown, and getting that wrong is a double
+free in the middle of a frame.
 
 A hook here sees every message from every source — other players, the server, admin messages,
 BattlEye, and the client's own `Chat`/`ChatPlayer` calls — and **returning without calling the
@@ -220,7 +310,20 @@ hook at `0x719B90` catches your own messages too.
 
 ## RPC — how a mod talks to its server mod
 
-There is no separate "mod command" channel. A mod sends its own messages with the same four
+Incoming calls arrive at **`0x5BB620`** (**verified** — hooked), which is five lines and
+forwards straight to script's `OnRPC`:
+
+```c
+FUN_1405bb620(CGame *game, sender, target, int kind, params)
+    -> FUN_140317060(game, out, id_of("OnRPC"), sender, target, kind, params)
+```
+
+The four values map onto script's `OnRPC(PlayerIdentity sender, Object target, int rpc_type,
+ParamsReadContext ctx)` in that order. The loader passes all four through without
+interpreting them: `kind` is the mod's own number, and `params` is a serialised stream whose
+shape belongs to whoever sent it — see open question 3.
+
+There is no separate "mod command" channel for outgoing calls. A mod sends its own messages with the same four
 natives every vanilla subsystem uses, over the game's own connection:
 
 | Script method | RVA |
@@ -323,17 +426,42 @@ For completeness, the engine's own way into script — what a plugin would use t
 | Resolve a method name on a script class to an id | `0x319210` |
 | Call a script method by id, up to four arguments | `0x317060` |
 
+`0x319210` is `FindMethod(scriptClass, name)` and is decompiled in full: it hashes the name
+with `h = h * 0x25 + c`, looks the hash up in a table at `+0x78` against a count at `+0x88`,
+walks the base-class chain at `+0x28` when it misses, and returns a method index from the
+table at `+0x90`. `0x5BB620` and `0x5CACD0` both use it to find `"OnRPC"` and `"OnEvent"`
+once and cache the index in a global. Together with `0x317060` that is a general **call any
+script method by name** primitive, which is a larger capability than anything on this page
+and is not yet used by anything.
+
 ## Open questions
 
-1. **The `CGame` instance pointer.** Needed before any native above can be called. Capturing
-   it from `0x5CACD0` is the cheap route; finding the global is the tidy one.
-2. **`RefString` construction** from native code, for every native that takes a string.
-3. **`ParamsReadContext`**, without which RPC payloads can be counted but not read.
-4. Whether `0x1D6260` is reached by every event or only by the manager's own queue — only two
-   raisers have been inspected, and both go through it.
-5. **How an event's payload becomes script's `Param`** — see the note under the dispatcher.
-   `0x5B8560` is the function to read next, and it blocks reading any event's contents from a
-   hook, which is most of what a logging plugin wants.
-6. None of this has been **verified at runtime** yet. Every address above is decompiled, and
-   every script fact is from the shipped scripts; the first hook installed on any of them is
-   what turns them into verified ones.
+1. **The `CGame` instance pointer.** Still needed before any native above can be called, and
+   still the thing blocking the console's `connect` and `disconnect`. It is no longer hard to
+   reach, though: **`0x5BB620`'s first argument is it**, and that function is now hooked, so
+   capturing a live `CGame` is a line of code in the RPC hook — once an RPC has arrived.
+   `0x719B90` also takes it, but does not use it, so the argument there is not worth trusting
+   without a check. Either candidate can be validated for free by calling the side-effect-free
+   predicates `IsClient` (`0x5B69F0`) or `IsMultiplayer` (`0x5B6A60`) on it. The tidy answer
+   is still a global, and `0xFEBBE0` is *not* it — that is the event manager.
+2. **`RefString` construction** from native code is now answered for reading, and nearly for
+   writing: the layout is above and `0x5DC10` builds one from a C string. What is untested is
+   handing a holder *we* allocated to an engine native that will release it.
+3. **`ParamsReadContext`**, without which RPC payloads can be counted but not read. This is
+   now the biggest remaining gap: the loader reports a remote call's number and its three
+   pointers, and nothing can be said about its contents.
+4. Whether `0x1D6260` is reached by every event or only by the manager's own queue. Partly
+   answered by running it: a menu session raised `StartedEvent`, `StartupEvent`,
+   `ScriptLogEvent` and `WorldCleaupEvent` through it, so it carries engine lifecycle events
+   and not just one subsystem's. Whether anything bypasses it is still unknown.
+5. **How an event's payload becomes script's `Param`.** The dispatcher passes exactly two
+   values — the `EventType` and the event's second qword — so there is no generic per-class
+   marshaller on that path, and `0x5B8560` is not one either. The payload must therefore live
+   in the event object's own fields, which means **reading an event's contents is a per-class
+   job**: find that class's layout, record the offsets in `dayz-data`, decode it in the
+   loader. `ChatMessageEvent` does not need it, because `0x719B90` hands over the same four
+   values one level earlier.
+6. Runtime verification. No longer "none of this": `0x1D6260`, `0x719B90` and `0x5BB620` are
+   hooked and the event path is **verified** — the name decoding, the event manager global and
+   the dispatch all work in a live session. What remains decompiled-only is everything about
+   *sending*: the chat natives, the four RPC natives, and the session natives.
